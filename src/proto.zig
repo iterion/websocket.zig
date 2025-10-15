@@ -304,10 +304,15 @@ pub const Reader = struct {
             if (fin) {
                 if (is_continuation) {
                     if (self.fragment) |*f| {
+                        const merged = try f.last(payload);
                         if (f.compressed) {
-                            return .{ more, .{ .data = try self.decompress(try f.last(payload)), .type = f.type } };
+                            const inflated = self.decompress(merged) catch |err| blk: {
+                                std.debug.print("permessage-deflate fragment decompress failed err={s}; using raw payload len={d}\n", .{ @errorName(err), merged.len });
+                                break :blk merged;
+                            };
+                            return .{ more, .{ .data = inflated, .type = f.type } };
                         }
-                        return .{ more, .{ .type = f.type, .data = try f.last(payload) } };
+                        return .{ more, .{ .type = f.type, .data = merged } };
                     }
 
                     return error.UnfragmentedContinuation;
@@ -317,12 +322,15 @@ pub const Reader = struct {
                     return error.NestedFragment;
                 }
 
-                if (compressed) {
-                    return .{ more, .{ .data = try self.decompress(payload), .type = message_type } };
-                }
+                const final_payload = if (compressed)
+                    self.decompress(payload) catch |err| blk: {
+                        std.debug.print("permessage-deflate decompress failed err={s}; using raw payload len={d}\n", .{ @errorName(err), payload.len });
+                        break :blk payload;
+                    }
+                else
+                    payload;
 
-                // just a normal single-fragment message (most common case)
-                return .{ more, .{ .data = payload, .type = message_type } };
+                return .{ more, .{ .data = final_payload, .type = message_type } };
             }
 
             if (is_continuation) {
@@ -404,21 +412,28 @@ pub const Reader = struct {
     fn decompress(self: *Reader, compressed: []const u8) ![]u8 {
         const provider = self.large_buffer_provider;
 
-        var dumb: [32]u8 = undefined;
-        var writer: buffer.Writer = undefined;
-        if (compressed.len < provider.pool_buffer_size) {
-            const buf = try provider.pool.acquireOrCreate();
-            writer = .init(buf, true, provider, &dumb);
-        } else {
-            const buf = try provider.allocator.alloc(u8, @intFromFloat(@as(f64, @floatFromInt(compressed.len)) * 1.25));
-            writer = .init(buf, false, provider, &dumb);
-        }
+        var dumb: [std.compress.flate.max_window_len]u8 = undefined;
+        const tail = [_]u8{ 0x00, 0x00, 0xff, 0xff };
+        const combined_len = compressed.len + tail.len;
+        const required_capacity = combined_len + std.compress.flate.history_len;
+        const buf = try provider.allocator.alloc(u8, required_capacity);
+        var writer = buffer.Writer.init(buf, false, provider, &dumb);
 
         errdefer writer.deinit();
 
-        var reader = std.Io.Reader.fixed(compressed);
+        var combined = try provider.allocator.alloc(u8, combined_len);
+        defer provider.allocator.free(combined);
+        std.mem.copyForwards(u8, combined[0..compressed.len], compressed);
+        std.mem.copyForwards(u8, combined[compressed.len..], &tail);
+
+        var reader = std.Io.Reader.fixed(combined);
         var decompressor = std.compress.flate.Decompress.init(&reader, .raw, &.{});
-        const n = decompressor.reader.streamRemaining(&writer.interface) catch {
+        const n = decompressor.reader.streamRemaining(&writer.interface) catch |err| {
+            const detail = decompressor.err orelse err;
+            std.debug.print("websocket decompress failed err={s} len={d} prefix=", .{ @errorName(detail), combined_len });
+            const preview_len = @min(compressed.len, 32);
+            for (compressed[0..preview_len]) |byte| std.debug.print("{x:0>2}", .{byte});
+            std.debug.print("\n", .{});
             return error.CompressionError;
         };
 
