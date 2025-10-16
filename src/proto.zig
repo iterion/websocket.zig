@@ -424,8 +424,7 @@ pub const Reader = struct {
         std.mem.copyForwards(u8, combined[compressed.len..], &tail);
 
         var reader = std.Io.Reader.fixed(combined);
-        var flate_buffer: [std.compress.flate.max_window_len]u8 = undefined;
-        var decompressor = std.compress.flate.Decompress.init(&reader, .raw, &flate_buffer);
+        var decompressor = std.compress.flate.Decompress.init(&reader, .raw, &.{});
         const written = blk: {
             const len = decompressor.reader.streamRemaining(&writer.writer) catch |err| {
                 const detail = decompressor.err orelse err;
@@ -437,15 +436,13 @@ pub const Reader = struct {
                     break :blk arr.items.len;
                 }
 
-                std.debug.print("permessage-deflate failed err={s} detail={s}\n", .{ @errorName(err), @errorName(detail) });
+                std.debug.print("permessage-deflate FOO failed err={s} detail={s}\n", .{ @errorName(err), @errorName(detail) });
                 return error.CompressionError;
             };
             break :blk len;
         };
         _ = written;
 
-        // let deinit for the message do the dealloc
-        // self.decompress_writer = writer;
         return writer.toOwnedSlice();
     }
 
@@ -649,6 +646,55 @@ test "Reader: exact read into static with no overflow" {
     try t.expectString("hello!", (try testRead(&reader, pair)).data);
 }
 
+test "Reader: permessage-deflate single frame" {
+    defer t.reset();
+
+    var pair = t.SocketPair.init(.{});
+    defer pair.deinit();
+
+    const payload = "permessage-deflate is fun!";
+    const compressed = try deflateStored(t.allocator, payload);
+    defer t.allocator.free(compressed);
+
+    pair.writer.frame(true, 1, compressed, 64);
+    pair.sendBuf();
+
+    var reader = testReader(.{ .max = 256, .static = 64, .compression = Compression{} });
+    defer reader.deinit();
+
+    const received = try testRead(&reader, pair);
+    try t.expectEqual(Message.Type.text, received.type);
+    try t.expectString(payload, received.data);
+    reader.done(received.type);
+}
+
+test "Reader: permessage-deflate fragmented" {
+    defer t.reset();
+
+    var pair = t.SocketPair.init(.{});
+    defer pair.deinit();
+
+    const payload = ("fragmentation with compression " ++ "still works ") ** 2;
+    const compressed = try deflateStored(t.allocator, payload);
+    defer t.allocator.free(compressed);
+
+    var split = compressed.len / 2;
+    if (split == 0) split = 1;
+    if (split == compressed.len) split -= 1;
+
+    pair.writer.frame(false, 1, compressed[0..split], 64);
+    pair.writer.cont(true, compressed[split..]);
+    pair.sendBuf();
+
+    var reader = testReader(.{ .max = 1024, .static = 128, .compression = Compression{} });
+    defer reader.deinit();
+
+    const received = try testRead(&reader, pair);
+    try t.expectEqual(Message.Type.text, received.type);
+    try t.expectString(payload, received.data);
+    reader.done(received.type);
+}
+
 test "Reader: fuzz" {
     defer t.reset();
     var r = t.getRandom();
@@ -829,6 +875,27 @@ test "Fragmented" {
     }
 }
 
+fn deflateStored(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
+    if (payload.len > std.math.maxInt(u16)) {
+        return error.StoredPayloadTooLarge;
+    }
+
+    const len: u16 = @intCast(payload.len);
+    const total = payload.len + 5;
+    var out = try allocator.alloc(u8, total);
+
+    out[0] = 0x01; // final block, stored type
+    out[1] = @intCast(len & 0x00ff);
+    out[2] = @intCast((len >> 8) & 0x00ff);
+
+    const nlen: u16 = ~len;
+    out[3] = @intCast(nlen & 0x00ff);
+    out[4] = @intCast((nlen >> 8) & 0x00ff);
+
+    std.mem.copyForwards(u8, out[5..], payload);
+    return out;
+}
+
 fn testReader(opts: anytype) Reader {
     const T = @TypeOf(opts);
 
@@ -843,7 +910,8 @@ fn testReader(opts: anytype) Reader {
 
     const static_size = if (@hasField(T, "static")) opts.static else 16;
     const reader_buf = aa.alloc(u8, static_size) catch unreachable;
-    return Reader.init(reader_buf, bp, null);
+    const compression: ?Compression = if (@hasField(T, "compression")) opts.compression else null;
+    return Reader.init(reader_buf, bp, compression);
 }
 
 fn testRead(reader: *Reader, pair: t.SocketPair) !Message {
