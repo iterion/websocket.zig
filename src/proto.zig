@@ -424,7 +424,8 @@ pub const Reader = struct {
         std.mem.copyForwards(u8, combined[compressed.len..], &tail);
 
         var reader = std.Io.Reader.fixed(combined);
-        var decompressor = std.compress.flate.Decompress.init(&reader, .raw, &.{});
+        var flate_buffer: [std.compress.flate.max_window_len]u8 = undefined;
+        var decompressor = std.compress.flate.Decompress.init(&reader, .raw, &flate_buffer);
         const written = blk: {
             const len = decompressor.reader.streamRemaining(&writer.writer) catch |err| {
                 const detail = decompressor.err orelse err;
