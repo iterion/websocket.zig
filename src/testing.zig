@@ -84,8 +84,6 @@ pub const Testing = struct {
         } else {
             try t.expectSlice(u8, data, message.data);
         }
-
-        self.received.items[idx].data = @constCast(&[_]u8{})[0..0];
     }
 
     pub fn expectClose(self: *Testing) !void {
