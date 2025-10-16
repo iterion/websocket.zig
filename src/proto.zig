@@ -412,14 +412,11 @@ pub const Reader = struct {
     fn decompress(self: *Reader, compressed: []const u8) ![]u8 {
         const provider = self.large_buffer_provider;
 
-        var dumb: [std.compress.flate.max_window_len]u8 = undefined;
         const tail = [_]u8{ 0x00, 0x00, 0xff, 0xff };
         const combined_len = compressed.len + tail.len;
-        const required_capacity = combined_len + std.compress.flate.history_len;
-        const buf = try provider.allocator.alloc(u8, required_capacity);
-        var writer = buffer.Writer.init(buf, false, provider, &dumb);
-
-        errdefer writer.deinit();
+        var arr = std.ArrayList(u8).empty;
+        defer arr.deinit(provider.allocator);
+        var writer = std.Io.Writer.Allocating.fromArrayList(provider.allocator, &arr);
 
         var combined = try provider.allocator.alloc(u8, combined_len);
         defer provider.allocator.free(combined);
@@ -428,17 +425,11 @@ pub const Reader = struct {
 
         var reader = std.Io.Reader.fixed(combined);
         var decompressor = std.compress.flate.Decompress.init(&reader, .raw, &.{});
-        const n = decompressor.reader.streamRemaining(&writer.interface) catch |err| {
-            const detail = decompressor.err orelse err;
-            std.debug.print("websocket decompress failed err={s} len={d} prefix=", .{ @errorName(detail), combined_len });
-            const preview_len = @min(compressed.len, 32);
-            for (compressed[0..preview_len]) |byte| std.debug.print("{x:0>2}", .{byte});
-            std.debug.print("\n", .{});
-            return error.CompressionError;
-        };
+        _ = try decompressor.reader.streamRemaining(&writer.writer);
 
-        self.decompress_writer = writer;
-        return writer.buf[0..n];
+        // let deinit for the message do the dealloc
+        // self.decompress_writer = writer;
+        return writer.toOwnedSlice();
     }
 
     inline fn usingLargeBuffer(self: *const Reader) bool {

@@ -1619,7 +1619,7 @@ fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator
                 error.LargeControl => conn.writeFramed(CLOSE_PROTOCOL_ERROR) catch {},
                 error.ReservedFlags => conn.writeFramed(CLOSE_PROTOCOL_ERROR) catch {},
                 error.CompressionDisabled => conn.writeFramed(CLOSE_PROTOCOL_ERROR) catch {},
-                error.CompressionError => conn.writeFramed(CLOSE_PROTOCOL_ERROR) catch {},
+                // error.CompressionError => conn.writeFramed(CLOSE_PROTOCOL_ERROR) catch {},
                 else => {},
             }
             log.debug("({f}) invalid websocket packet: {}", .{ conn.address, err });
