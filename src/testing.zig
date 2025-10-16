@@ -73,8 +73,10 @@ pub const Testing = struct {
     pub fn expectMessage(self: *Testing, op: ws.Message.Type, data: []const u8) !void {
         try self.ensureMessage();
 
-        const message = self.received.items[self.received_index];
-        self.received_index += 1;
+        const idx = self.received_index;
+        const message = self.received.items[idx];
+        self.received_index = idx + 1;
+        defer self.reader.done(message.type);
 
         try t.expectEqual(op, message.type);
         if (op == .text) {
@@ -82,6 +84,8 @@ pub const Testing = struct {
         } else {
             try t.expectSlice(u8, data, message.data);
         }
+
+        self.received.items[idx].data = @constCast(&[_]u8{})[0..0];
     }
 
     pub fn expectClose(self: *Testing) !void {

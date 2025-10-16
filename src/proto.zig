@@ -89,9 +89,8 @@ pub const Reader = struct {
 
     allow_compressed: bool,
 
-    // if we returned a decompressed message, it's stored here so that we can
-    // cleanup when the user is done with the message
-    decompress_writer: ?buffer.Writer,
+    // buffers for messages we decompressed and returned to the caller
+    decompressed: std.ArrayListUnmanaged([]u8),
 
     const DecompressorType = std.compress.flate.Decompress;
 
@@ -103,7 +102,7 @@ pub const Reader = struct {
             .static = static,
             .message_len = 0,
             .fragment = null,
-            .decompress_writer = null,
+            .decompressed = .empty,
             .allow_compressed = compression != null,
             .large_buffer_provider = large_buffer_provider,
         };
@@ -113,9 +112,11 @@ pub const Reader = struct {
         if (self.fragment) |*f| {
             f.deinit();
         }
-        if (self.decompress_writer) |*dw| {
-            dw.deinit();
+        const allocator = self.large_buffer_provider.allocator;
+        for (self.decompressed.items) |buf| {
+            allocator.free(buf);
         }
+        self.decompressed.deinit(allocator);
 
         // not our job to manage the static buffer, its buf was given to us an init and we
         // can't know where it came from.
@@ -371,9 +372,9 @@ pub const Reader = struct {
                 f.deinit();
                 self.fragment = null;
             }
-            if (self.decompress_writer) |*dw| {
-                dw.deinit();
-                self.decompress_writer = null;
+            if (self.decompressed.items.len > 0) {
+                const buf = self.decompressed.orderedRemove(0);
+                self.large_buffer_provider.allocator.free(buf);
             }
         }
 
@@ -414,9 +415,6 @@ pub const Reader = struct {
 
         const tail = [_]u8{ 0x00, 0x00, 0xff, 0xff };
         const combined_len = compressed.len + tail.len;
-        var arr = std.ArrayList(u8).empty;
-        defer arr.deinit(provider.allocator);
-        var writer = std.Io.Writer.Allocating.fromArrayList(provider.allocator, &arr);
 
         var combined = try provider.allocator.alloc(u8, combined_len);
         defer provider.allocator.free(combined);
@@ -424,26 +422,40 @@ pub const Reader = struct {
         std.mem.copyForwards(u8, combined[compressed.len..], &tail);
 
         var reader = std.Io.Reader.fixed(combined);
-        var decompressor = std.compress.flate.Decompress.init(&reader, .raw, &.{});
-        const written = blk: {
-            const len = decompressor.reader.streamRemaining(&writer.writer) catch |err| {
-                const detail = decompressor.err orelse err;
-                if (err == error.ReadFailed and detail == error.EndOfStream) {
-                    std.debug.print(
-                        "permessage-deflate truncated err={s} detail={s} len={d}\n",
-                        .{ @errorName(err), @errorName(detail), arr.items.len },
-                    );
-                    break :blk arr.items.len;
-                }
+        var flate_buffer: [std.compress.flate.max_window_len]u8 = undefined;
+        var decompressor = std.compress.flate.Decompress.init(&reader, .raw, &flate_buffer);
 
-                std.debug.print("permessage-deflate FOO failed err={s} detail={s}\n", .{ @errorName(err), @errorName(detail) });
+        var writer = std.Io.Writer.Allocating.init(provider.allocator);
+        var ownership_transferred = false;
+        defer {
+            if (!ownership_transferred) {
+                writer.deinit();
+            }
+        }
+
+        _ = decompressor.reader.streamRemaining(&writer.writer) catch |err| {
+            const detail = decompressor.err orelse err;
+            if (err == error.ReadFailed and writer.writer.end > 0) {
+                std.debug.print(
+                    "permessage-deflate truncated err={s} detail={s} len={d}\n",
+                    .{ @errorName(err), @errorName(detail), writer.writer.end },
+                );
+            } else {
+                std.debug.print("permessage-deflate failed err={s} detail={s}\n", .{ @errorName(err), @errorName(detail) });
                 return error.CompressionError;
-            };
-            break :blk len;
+            }
         };
-        _ = written;
+        const produced = writer.writer.end;
 
-        return writer.toOwnedSlice();
+        var list = writer.toArrayList();
+        ownership_transferred = true;
+
+        const buf = list.allocatedSlice();
+        self.decompressed.append(provider.allocator, buf) catch |err| {
+            provider.allocator.free(buf);
+            return err;
+        };
+        return buf[0..produced];
     }
 
     inline fn usingLargeBuffer(self: *const Reader) bool {
