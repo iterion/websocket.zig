@@ -428,7 +428,7 @@ pub const Reader = struct {
         const written = blk: {
             const len = decompressor.reader.streamRemaining(&writer.writer) catch |err| {
                 const detail = decompressor.err orelse err;
-                if (err == error.ReadFailed and arr.items.len > 0) {
+                if (err == error.ReadFailed and detail == error.EndOfStream) {
                     std.debug.print(
                         "permessage-deflate truncated err={s} detail={s} len={d}\n",
                         .{ @errorName(err), @errorName(detail), arr.items.len },
